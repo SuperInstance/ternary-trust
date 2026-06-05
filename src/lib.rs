@@ -1,831 +1,726 @@
-//! # ternary-trust
-//!
-//! Trust and relationship dynamics for ternary agents.
-//!
-//! Inspired by dogmind-arena's 5 trust stages and findings from the trust-genome experiment:
-//! genomes alone don't produce trust — agents need learning and forgiveness mechanics.
-//! Forgiveness rates of 0.5–0.7 produce the most bonding behavior.
-
 #![forbid(unsafe_code)]
-#![deny(missing_docs)]
+
+//! ternary-trust: Trust and relationship dynamics between agents.
+//!
+//! Models bidirectional trust scores, five trust stages (inspired by
+//! dogmind-arena), trust decay over time, forgiveness mechanics, and a
+//! trust network graph. Reputation scores aggregate trust from multiple
+//! sources into a single metric.
 
 use std::collections::HashMap;
-use std::fmt;
 
 // ---------------------------------------------------------------------------
-// Trust thresholds & bounds
+// Trust stages (inspired by dogmind-arena)
 // ---------------------------------------------------------------------------
 
-/// Minimum possible trust score.
-pub const TRUST_MIN: i32 = -100;
-/// Maximum possible trust score.
-pub const TRUST_MAX: i32 = 100;
-
-/// Default trust decay rate per step (applied toward zero).
-pub const DEFAULT_DECAY_RATE: f64 = 0.02;
-
-// ---------------------------------------------------------------------------
-// TrustStage — five stages from dogmind-arena
-// ---------------------------------------------------------------------------
-
-/// Trust stages inspired by dogmind-arena.
-///
-/// | Stage         | Trust range |
-/// |---------------|-------------|
-/// | Stranger      | < -20       |
-/// | Wary          | -20 … 0     |
-/// | Acquaintance  |  0 … 20     |
-/// | Friend        | 20 … 50     |
-/// | Companion     | > 50        |
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Five stages of trust, from hostile to alliance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TrustStage {
-    /// Hostile or unknown — trust below -20.
-    Stranger,
-    /// Cautious — trust between -20 and 0.
+    Hostile,
     Wary,
-    /// Known but not close — trust between 0 and 20.
-    Acquaintance,
-    /// Positive regard — trust between 20 and 50.
-    Friend,
-    /// Deep bond — trust above 50.
-    Companion,
+    Neutral,
+    Friendly,
+    Allied,
 }
 
 impl TrustStage {
-    /// Determine the trust stage from a raw trust score.
-    pub fn from_trust(score: i32) -> Self {
-        if score < -20 {
-            TrustStage::Stranger
-        } else if score < 0 {
+    /// Convert a numeric score (-1.0 to +1.0) into a trust stage.
+    pub fn from_score(score: f64) -> Self {
+        if score < -0.6 {
+            TrustStage::Hostile
+        } else if score < -0.2 {
             TrustStage::Wary
-        } else if score < 20 {
-            TrustStage::Acquaintance
-        } else if score < 50 {
-            TrustStage::Friend
+        } else if score < 0.2 {
+            TrustStage::Neutral
+        } else if score < 0.6 {
+            TrustStage::Friendly
         } else {
-            TrustStage::Companion
+            TrustStage::Allied
         }
     }
 
-    /// Human-readable display name.
-    pub fn display_name(&self) -> &'static str {
+    /// Return the human-readable label.
+    pub fn label(&self) -> &'static str {
         match self {
-            TrustStage::Stranger => "Stranger",
-            TrustStage::Wary => "Wary",
-            TrustStage::Acquaintance => "Acquaintance",
-            TrustStage::Friend => "Friend",
-            TrustStage::Companion => "Companion",
-        }
-    }
-
-    /// Ordinal value (0 = Stranger … 4 = Companion).
-    pub fn ordinal(&self) -> u8 {
-        match self {
-            TrustStage::Stranger => 0,
-            TrustStage::Wary => 1,
-            TrustStage::Acquaintance => 2,
-            TrustStage::Friend => 3,
-            TrustStage::Companion => 4,
+            TrustStage::Hostile => "hostile",
+            TrustStage::Wary => "wary",
+            TrustStage::Neutral => "neutral",
+            TrustStage::Friendly => "friendly",
+            TrustStage::Allied => "allied",
         }
     }
 }
 
-impl fmt::Display for TrustStage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.display_name())
-    }
-}
-
 // ---------------------------------------------------------------------------
-// TrustEvent — actions that affect trust
+// TrustEvent
 // ---------------------------------------------------------------------------
 
-/// Actions that affect trust, each with a ternary impact magnitude.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An action that modifies trust between two agents.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TrustEvent {
-    /// Positive cooperation. Default impact: +10.
-    Cooperate(i32),
-    /// Defection / non-cooperation. Default impact: -15.
-    Defect(i32),
-    /// Ignoring an agent. Default impact: -5.
-    Ignore(i32),
-    /// Forgiveness gesture. Default impact: +8.
-    Forgive(i32),
-    /// Serious betrayal. Default impact: -30.
-    Betray(i32),
+    /// A positive action that increases trust.
+    Positive {
+        from: String,
+        to: String,
+        magnitude: f64,
+        description: String,
+    },
+    /// A negative action that decreases trust.
+    Negative {
+        from: String,
+        to: String,
+        magnitude: f64,
+        description: String,
+    },
+    /// A betrayal — large negative trust impact.
+    Betrayal {
+        from: String,
+        to: String,
+        description: String,
+    },
 }
 
 impl TrustEvent {
-    /// Create with default ternary impact.
-    pub fn default_impact(&self) -> i32 {
-        match self {
-            TrustEvent::Cooperate(_) => 10,
-            TrustEvent::Defect(_) => -15,
-            TrustEvent::Ignore(_) => -5,
-            TrustEvent::Forgive(_) => 8,
-            TrustEvent::Betray(_) => -30,
+    /// Create a positive trust event.
+    pub fn positive(from: impl Into<String>, to: impl Into<String>, magnitude: f64, desc: impl Into<String>) -> Self {
+        TrustEvent::Positive {
+            from: from.into(),
+            to: to.into(),
+            magnitude: magnitude.abs().min(1.0),
+            description: desc.into(),
         }
     }
 
-    /// Get the effective impact value.
-    pub fn impact(&self) -> i32 {
-        match self {
-            TrustEvent::Cooperate(v)
-            | TrustEvent::Defect(v)
-            | TrustEvent::Ignore(v)
-            | TrustEvent::Forgive(v)
-            | TrustEvent::Betray(v) => *v,
+    /// Create a negative trust event.
+    pub fn negative(from: impl Into<String>, to: impl Into<String>, magnitude: f64, desc: impl Into<String>) -> Self {
+        TrustEvent::Negative {
+            from: from.into(),
+            to: to.into(),
+            magnitude: magnitude.abs().min(1.0),
+            description: desc.into(),
         }
     }
 
-    /// Is this a positive (trust-increasing) event?
-    pub fn is_positive(&self) -> bool {
-        self.impact() > 0
+    /// Create a betrayal event (large negative impact, magnitude fixed at -0.5).
+    pub fn betrayal(from: impl Into<String>, to: impl Into<String>, desc: impl Into<String>) -> Self {
+        TrustEvent::Betrayal {
+            from: from.into(),
+            to: to.into(),
+            description: desc.into(),
+        }
     }
 
-    /// Is this a negative (trust-decreasing) event?
-    pub fn is_negative(&self) -> bool {
-        self.impact() < 0
+    /// Return the (from, to) pair.
+    pub fn parties(&self) -> (&str, &str) {
+        match self {
+            TrustEvent::Positive { from, to, .. }
+            | TrustEvent::Negative { from, to, .. }
+            | TrustEvent::Betrayal { from, to, .. } => (from, to),
+        }
     }
-}
 
-impl Default for TrustEvent {
-    fn default() -> Self {
-        TrustEvent::Cooperate(10)
+    /// Return the trust delta this event represents.
+    pub fn delta(&self) -> f64 {
+        match self {
+            TrustEvent::Positive { magnitude, .. } => *magnitude,
+            TrustEvent::Negative { magnitude, .. } => -*magnitude,
+            TrustEvent::Betrayal { .. } => -0.5,
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// TrustRelation — bidirectional trust between two agents
+// TrustDecay
 // ---------------------------------------------------------------------------
 
-/// Bidirectional trust scores between two agents (A and B).
+/// Configuration for how trust fades over time.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TrustRelation {
-    /// How much A trusts B.
-    pub a_trusts_b: i32,
-    /// How much B trusts A.
-    pub b_trusts_a: i32,
-}
-
-impl TrustRelation {
-    /// Create a new relation starting at neutral trust (0, 0).
-    pub fn new() -> Self {
-        Self {
-            a_trusts_b: 0,
-            b_trusts_a: 0,
-        }
-    }
-
-    /// Create from explicit scores.
-    pub fn from_scores(a: i32, b: i32) -> Self {
-        Self {
-            a_trusts_b: clamp(a),
-            b_trusts_a: clamp(b),
-        }
-    }
-
-    /// Apply an event from A toward B (affects a_trusts_b).
-    pub fn apply_event_a_to_b(&mut self, event: TrustEvent) {
-        self.a_trusts_b = clamp(self.a_trusts_b + event.impact());
-    }
-
-    /// Apply an event from B toward A (affects b_trusts_a).
-    pub fn apply_event_b_to_a(&mut self, event: TrustEvent) {
-        self.b_trusts_a = clamp(self.b_trusts_a + event.impact());
-    }
-
-    /// Average of both directions.
-    pub fn average(&self) -> f64 {
-        (self.a_trusts_b as f64 + self.b_trusts_a as f64) / 2.0
-    }
-
-    /// Trust stage of A toward B.
-    pub fn stage_a_to_b(&self) -> TrustStage {
-        TrustStage::from_trust(self.a_trusts_b)
-    }
-
-    /// Trust stage of B toward A.
-    pub fn stage_b_to_a(&self) -> TrustStage {
-        TrustStage::from_trust(self.b_trusts_a)
-    }
-
-    /// Are both directions at least Acquaintance?
-    pub fn is_mutual_acquaintance(&self) -> bool {
-        self.stage_a_to_b().ordinal() >= TrustStage::Acquaintance.ordinal()
-            && self.stage_b_to_a().ordinal() >= TrustStage::Acquaintance.ordinal()
-    }
-
-    /// Apply symmetric decay toward zero for both directions.
-    pub fn decay(&mut self, rate: f64) {
-        self.a_trusts_b = decay_toward_zero(self.a_trusts_b, rate);
-        self.b_trusts_a = decay_toward_zero(self.b_trusts_a, rate);
-    }
-}
-
-impl Default for TrustRelation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TrustDecay — configurable trust fading
-// ---------------------------------------------------------------------------
-
-/// Trust decays toward zero over time at a configurable rate.
-#[derive(Debug, Clone)]
 pub struct TrustDecay {
-    /// Current trust value.
-    pub trust: i32,
-    /// Decay rate per step (0.0–1.0).
-    pub decay_rate: f64,
+    /// Fraction of trust retained per tick (0.0 = instant decay, 1.0 = no decay).
+    pub retention_rate: f64,
+    /// Minimum absolute trust score (decays toward zero but not past this).
+    pub floor: f64,
 }
 
 impl TrustDecay {
-    /// Create with a specific decay rate.
-    pub fn new(trust: i32, decay_rate: f64) -> Self {
+    /// Create a decay config.
+    pub fn new(retention_rate: f64, floor: f64) -> Self {
         Self {
-            trust: clamp(trust),
-            decay_rate: decay_rate.clamp(0.0, 1.0),
+            retention_rate: retention_rate.clamp(0.0, 1.0),
+            floor: floor.abs(),
         }
     }
 
-    /// Create with default decay rate.
-    pub fn with_default_rate(trust: i32) -> Self {
-        Self::new(trust, DEFAULT_DECAY_RATE)
-    }
-
-    /// Advance one time step — trust moves toward zero by decay_rate fraction.
-    pub fn step(&mut self) {
-        self.trust = decay_toward_zero(self.trust, self.decay_rate);
-    }
-
-    /// Run N decay steps.
-    pub fn step_n(&mut self, n: u32) {
-        for _ in 0..n {
-            self.step();
+    /// No decay — trust never fades.
+    pub fn none() -> Self {
+        Self {
+            retention_rate: 1.0,
+            floor: 0.0,
         }
     }
 
-    /// Current trust stage.
-    pub fn stage(&self) -> TrustStage {
-        TrustStage::from_trust(self.trust)
+    /// Apply one tick of decay to a score, pulling it toward zero.
+    pub fn apply(&self, score: f64) -> f64 {
+        let decayed = score * self.retention_rate;
+        if decayed.abs() < self.floor {
+            if score > 0.0 {
+                self.floor
+            } else if score < 0.0 {
+                -self.floor
+            } else {
+                0.0
+            }
+        } else {
+            decayed
+        }
+    }
+}
+
+impl Default for TrustDecay {
+    fn default() -> Self {
+        Self::none()
     }
 }
 
 // ---------------------------------------------------------------------------
-// ForgivenessConfig — negative trust recovery
+// ForgivenessConfig
 // ---------------------------------------------------------------------------
 
-/// Configuration for how quickly negative trust recovers.
-///
-/// Inspired by the trust-genome finding that forgiveness rates of 0.5–0.7
-/// produce the most bonding between agents.
-#[derive(Debug, Clone)]
+/// How quickly negative trust recovers toward neutral.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForgivenessConfig {
-    /// Rate of forgiveness per step (0.0–1.0). Recommended: 0.5–0.7.
-    pub rate: f64,
-    /// Trust must be at or above this threshold for forgiveness to kick in
-    /// (i.e. only applies when trust is negative and above this floor).
-    pub threshold: i32,
-    /// Minimum steps between forgiveness applications.
-    pub cooldown: u32,
+    /// Amount of positive trust gained per forgiveness tick.
+    pub recovery_rate: f64,
+    /// Maximum negative trust that can be recovered per tick.
+    pub max_recovery: f64,
 }
 
 impl ForgivenessConfig {
-    /// Create with recommended defaults (rate 0.6, threshold -50, cooldown 5).
-    pub fn recommended() -> Self {
+    /// Create a forgiveness config.
+    pub fn new(recovery_rate: f64, max_recovery: f64) -> Self {
         Self {
-            rate: 0.6,
-            threshold: -50,
-            cooldown: 5,
+            recovery_rate: recovery_rate.max(0.0),
+            max_recovery: max_recovery.max(0.0),
         }
     }
 
-    /// Apply one forgiveness step to a trust value.
-    ///
-    /// If trust is negative and above `threshold`, move it toward zero by `rate`.
-    /// Returns `(new_trust, steps_since_last_forgiveness)`.
-    pub fn apply(&self, trust: i32, steps_since_last: u32) -> (i32, u32) {
-        if trust >= 0 || trust < self.threshold || steps_since_last < self.cooldown {
-            return (trust, steps_since_last + 1);
+    /// No forgiveness — negative trust persists.
+    pub fn none() -> Self {
+        Self {
+            recovery_rate: 0.0,
+            max_recovery: 0.0,
         }
-        let new_trust = decay_toward_zero(trust, self.rate);
-        (new_trust, 0)
+    }
+
+    /// Apply one tick of forgiveness to a score.
+    pub fn apply(&self, score: f64) -> f64 {
+        if score >= 0.0 {
+            score
+        } else {
+            let recovery = self.recovery_rate.min(self.max_recovery).min(score.abs());
+            score + recovery
+        }
     }
 }
 
 impl Default for ForgivenessConfig {
     fn default() -> Self {
-        Self::recommended()
+        Self::none()
     }
 }
 
 // ---------------------------------------------------------------------------
-// TrustNetwork — graph of trust relationships
+// TrustRelation
 // ---------------------------------------------------------------------------
 
-/// A graph of trust relationships between N named agents.
-#[derive(Debug, Clone)]
+/// Bidirectional trust scores between two agents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustRelation {
+    pub agent_a: String,
+    pub agent_b: String,
+    /// Trust from A toward B (-1.0 to +1.0).
+    pub a_to_b: f64,
+    /// Trust from B toward A (-1.0 to +1.0).
+    pub b_to_a: f64,
+}
+
+impl TrustRelation {
+    /// Create a new relation starting at neutral (0.0) trust both ways.
+    pub fn new(a: impl Into<String>, b: impl Into<String>) -> Self {
+        Self {
+            agent_a: a.into(),
+            agent_b: b.into(),
+            a_to_b: 0.0,
+            b_to_a: 0.0,
+        }
+    }
+
+    /// Create a relation with explicit initial scores.
+    pub fn with_scores(
+        a: impl Into<String>,
+        b: impl Into<String>,
+        a_to_b: f64,
+        b_to_a: f64,
+    ) -> Self {
+        Self {
+            agent_a: a.into(),
+            agent_b: b.into(),
+            a_to_b: a_to_b.clamp(-1.0, 1.0),
+            b_to_a: b_to_a.clamp(-1.0, 1.0),
+        }
+    }
+
+    /// Get trust from `from` toward `to`. Returns None if neither agent matches.
+    pub fn trust_from(&self, from: &str, to: &str) -> Option<f64> {
+        if from == self.agent_a && to == self.agent_b {
+            Some(self.a_to_b)
+        } else if from == self.agent_b && to == self.agent_a {
+            Some(self.b_to_a)
+        } else {
+            None
+        }
+    }
+
+    /// Apply a trust event delta to the correct direction.
+    pub fn apply_event(&mut self, event: &TrustEvent) {
+        let (from, to) = event.parties();
+        let delta = event.delta();
+        if from == self.agent_a && to == self.agent_b {
+            self.a_to_b = (self.a_to_b + delta).clamp(-1.0, 1.0);
+        } else if from == self.agent_b && to == self.agent_a {
+            self.b_to_a = (self.b_to_a + delta).clamp(-1.0, 1.0);
+        }
+    }
+
+    /// Average trust in both directions.
+    pub fn average(&self) -> f64 {
+        (self.a_to_b + self.b_to_a) / 2.0
+    }
+
+    /// The trust stage for A→B.
+    pub fn stage_a_to_b(&self) -> TrustStage {
+        TrustStage::from_score(self.a_to_b)
+    }
+
+    /// The trust stage for B→A.
+    pub fn stage_b_to_a(&self) -> TrustStage {
+        TrustStage::from_score(self.b_to_a)
+    }
+
+    /// Does this relation involve the given agent?
+    pub fn involves(&self, agent: &str) -> bool {
+        self.agent_a == agent || self.agent_b == agent
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TrustNetwork
+// ---------------------------------------------------------------------------
+
+/// A graph of trust relationships indexed by agent pair.
+#[derive(Debug, Clone, Default)]
 pub struct TrustNetwork {
     relations: HashMap<(String, String), TrustRelation>,
-    agents: Vec<String>,
+    decay: TrustDecay,
+    forgiveness: ForgivenessConfig,
 }
 
 impl TrustNetwork {
     /// Create an empty network.
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a network with decay and forgiveness configs.
+    pub fn with_config(decay: TrustDecay, forgiveness: ForgivenessConfig) -> Self {
         Self {
             relations: HashMap::new(),
-            agents: Vec::new(),
+            decay,
+            forgiveness,
         }
     }
 
-    /// Create a network with N named agents (all starting at neutral trust).
-    pub fn with_agents(names: &[&str]) -> Self {
-        let mut net = Self::new();
-        for &name in names {
-            net.add_agent(name);
-        }
-        net
-    }
-
-    /// Register an agent in the network.
-    pub fn add_agent(&mut self, name: &str) {
-        let name = name.to_string();
-        if !self.agents.contains(&name) {
-            for other in &self.agents {
-                self.relations
-                    .insert(canonical_key(&name, other), TrustRelation::new());
-            }
-            self.agents.push(name);
-        }
-    }
-
-    /// Number of agents in the network.
-    pub fn agent_count(&self) -> usize {
-        self.agents.len()
-    }
-
-    /// Get the trust relation between two agents.
-    pub fn trust_between(&self, a: &str, b: &str) -> Option<&TrustRelation> {
-        self.relations.get(&canonical_key(a, b))
-    }
-
-    /// Get mutable trust relation between two agents.
-    pub fn trust_between_mut(&mut self, a: &str, b: &str) -> Option<&mut TrustRelation> {
-        self.relations.get_mut(&canonical_key(a, b))
-    }
-
-    /// Average trust of all agents toward `agent` (how much others trust them).
-    pub fn reputation_of(&self, agent: &str) -> f64 {
-        let mut sum = 0i64;
-        let mut count = 0u64;
-        for ((a, b), rel) in &self.relations {
-            if b == agent {
-                // canonical key (a,b) where a < b. a_trusts_b = how much a trusts b = agent.
-                sum += rel.a_trusts_b as i64;
-                count += 1;
-            } else if a == agent {
-                // b_trusts_a = how much b trusts a = agent.
-                sum += rel.b_trusts_a as i64;
-                count += 1;
-            }
-        }
-        if count == 0 {
-            0.0
+    /// Get or create a relation between two agents (order-independent).
+    fn key(a: &str, b: &str) -> (String, String) {
+        if a <= b {
+            (a.to_string(), b.to_string())
         } else {
-            sum as f64 / count as f64
+            (b.to_string(), a.to_string())
         }
     }
 
-    /// Agent with highest average trust from others.
-    pub fn most_trusted(&self) -> Option<&str> {
-        self.agents
-            .iter()
-            .max_by(|a, b| {
-                self.reputation_of(a)
-                    .partial_cmp(&self.reputation_of(b))
-                    .unwrap()
-            })
-            .map(|s| s.as_str())
+    /// Get the relation between two agents, if any.
+    pub fn get(&self, a: &str, b: &str) -> Option<&TrustRelation> {
+        self.relations.get(&Self::key(a, b))
     }
 
-    /// Agent with lowest average trust from others.
-    pub fn least_trusted(&self) -> Option<&str> {
-        self.agents
-            .iter()
-            .min_by(|a, b| {
-                self.reputation_of(a)
-                    .partial_cmp(&self.reputation_of(b))
-                    .unwrap()
-            })
-            .map(|s| s.as_str())
+    /// Get a mutable reference to the relation, creating it at neutral if needed.
+    pub fn get_or_create(&mut self, a: &str, b: &str) -> &mut TrustRelation {
+        let key = Self::key(a, b);
+        self.relations.entry(key).or_insert_with(|| TrustRelation::new(a, b))
     }
 
-    /// Mutual trust score between two agents (average of both directions).
-    pub fn mutual_trust(&self, a: &str, b: &str) -> f64 {
-        self.trust_between(a, b).map_or(0.0, |r| r.average())
+    /// Apply a trust event to the network.
+    pub fn apply_event(&mut self, event: &TrustEvent) {
+        let (from, to) = event.parties();
+        let rel = self.get_or_create(from, to);
+        rel.apply_event(event);
     }
 
-    /// Trust circle: all agents whose mutual trust with `agent` is >= `min_trust`.
-    pub fn trust_circle(&self, agent: &str, min_trust: f64) -> Vec<&str> {
-        self.agents
-            .iter()
-            .filter(|other| *other != agent && self.mutual_trust(agent, other) >= min_trust)
-            .map(|s| s.as_str())
+    /// Apply one tick of decay and forgiveness to all relations.
+    pub fn tick(&mut self) {
+        for rel in self.relations.values_mut() {
+            rel.a_to_b = self.decay.apply(rel.a_to_b);
+            rel.b_to_a = self.decay.apply(rel.b_to_a);
+            rel.a_to_b = self.forgiveness.apply(rel.a_to_b);
+            rel.b_to_a = self.forgiveness.apply(rel.b_to_a);
+        }
+    }
+
+    /// Number of trust relations in the network.
+    pub fn relation_count(&self) -> usize {
+        self.relations.len()
+    }
+
+    /// List all agents that have at least one relation.
+    pub fn agents(&self) -> Vec<&str> {
+        let mut set = std::collections::HashSet::new();
+        for rel in self.relations.values() {
+            set.insert(rel.agent_a.as_str());
+            set.insert(rel.agent_b.as_str());
+        }
+        set.into_iter().collect()
+    }
+
+    /// Get all relations involving a given agent.
+    pub fn relations_for(&self, agent: &str) -> Vec<&TrustRelation> {
+        self.relations
+            .values()
+            .filter(|r| r.involves(agent))
             .collect()
     }
-
-    /// Apply an event from `source` toward `target`.
-    pub fn apply_event(&mut self, source: &str, target: &str, event: TrustEvent) {
-        let ck = canonical_key(source, target);
-        if let Some(rel) = self.relations.get_mut(&ck) {
-            if ck == (source.to_string(), target.to_string()) {
-                rel.apply_event_a_to_b(event);
-            } else {
-                // canonical key is (target, source), so source is "b" in the relation
-                rel.apply_event_b_to_a(event);
-            }
-        }
-    }
-
-    /// Apply decay to all relations.
-    pub fn decay_all(&mut self, rate: f64) {
-        for rel in self.relations.values_mut() {
-            rel.decay(rate);
-        }
-    }
-}
-
-impl Default for TrustNetwork {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn canonical_key(a: &str, b: &str) -> (String, String) {
-    if a <= b {
-        (a.to_string(), b.to_string())
-    } else {
-        (b.to_string(), a.to_string())
-    }
 }
 
 // ---------------------------------------------------------------------------
-// ReputationScore — aggregate trust from multiple sources
+// ReputationScore
 // ---------------------------------------------------------------------------
 
-/// Methods for aggregating trust scores from multiple sources.
-#[derive(Debug, Clone)]
+/// Aggregate trust score for an agent, computed from multiple sources.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReputationScore {
-    /// Individual trust scores from different sources.
-    pub scores: Vec<i32>,
+    pub agent: String,
+    pub scores: Vec<f64>,
 }
 
 impl ReputationScore {
-    /// Create from a slice of scores.
-    pub fn new(scores: &[i32]) -> Self {
+    /// Create an empty reputation score.
+    pub fn new(agent: impl Into<String>) -> Self {
         Self {
-            scores: scores.iter().map(|&s| clamp(s)).collect(),
+            agent: agent.into(),
+            scores: Vec::new(),
         }
     }
 
-    /// Simple (unweighted) average.
+    /// Add a trust score from one source.
+    pub fn add(&mut self, score: f64) {
+        self.scores.push(score.clamp(-1.0, 1.0));
+    }
+
+    /// Compute the average reputation. Returns 0.0 if no scores.
     pub fn average(&self) -> f64 {
         if self.scores.is_empty() {
             return 0.0;
         }
-        self.scores.iter().map(|&s| s as f64).sum::<f64>() / self.scores.len() as f64
+        self.scores.iter().sum::<f64>() / self.scores.len() as f64
     }
 
-    /// Weighted average. Panics if weights.len() != scores.len().
-    pub fn weighted_average(&self, weights: &[f64]) -> f64 {
-        assert_eq!(weights.len(), self.scores.len(), "weights must match scores");
-        if self.scores.is_empty() {
-            return 0.0;
-        }
-        let total_weight: f64 = weights.iter().sum();
-        if total_weight == 0.0 {
-            return 0.0;
-        }
-        let sum: f64 = self
-            .scores
-            .iter()
-            .zip(weights.iter())
-            .map(|(&s, &w)| s as f64 * w)
-            .sum();
-        sum / total_weight
+    /// Compute the minimum (worst-case) reputation.
+    pub fn min(&self) -> f64 {
+        self.scores.iter().cloned().fold(0.0_f64, f64::min)
     }
 
-    /// Minimum score (most pessimistic view).
-    pub fn min(&self) -> i32 {
-        self.scores.iter().copied().min().unwrap_or(0)
+    /// Compute the maximum (best-case) reputation.
+    pub fn max(&self) -> f64 {
+        self.scores.iter().cloned().fold(0.0_f64, f64::max)
     }
 
-    /// Maximum score (most optimistic view).
-    pub fn max(&self) -> i32 {
-        self.scores.iter().copied().max().unwrap_or(0)
-    }
-
-    /// Consensus: fraction of scores that are non-negative (>= 0).
-    pub fn consensus(&self) -> f64 {
-        if self.scores.is_empty() {
-            return 0.0;
-        }
-        let positive = self.scores.iter().filter(|&&s| s >= 0).count();
-        positive as f64 / self.scores.len() as f64
-    }
-
-    /// Overall trust stage based on average.
+    /// The trust stage for the average reputation.
     pub fn stage(&self) -> TrustStage {
-        TrustStage::from_trust(self.average().round() as i32)
+        TrustStage::from_score(self.average())
+    }
+
+    /// Number of contributing scores.
+    pub fn count(&self) -> usize {
+        self.scores.len()
+    }
+
+    /// Build a reputation score from a network for a given agent.
+    pub fn from_network(network: &TrustNetwork, agent: &str) -> Self {
+        let mut rep = Self::new(agent);
+        for rel in network.relations_for(agent) {
+            if let Some(score) = rel.trust_from(agent, &rel.agent_a).or_else(|| rel.trust_from(agent, &rel.agent_b)) {
+                // Get the score others have toward this agent
+            }
+            // Add the trust others have toward this agent
+            if rel.agent_a == agent {
+                rep.add(rel.b_to_a); // how B feels about A
+            } else {
+                rep.add(rel.a_to_b); // how A feels about this agent
+            }
+        }
+        rep
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn clamp(v: i32) -> i32 {
-    v.clamp(TRUST_MIN, TRUST_MAX)
-}
-
-fn decay_toward_zero(v: i32, rate: f64) -> i32 {
-    if v == 0 {
-        return 0;
-    }
-    let delta = (v.abs() as f64 * rate).round() as i32;
-    if v > 0 {
-        (v - delta).max(0)
-    } else {
-        (v + delta).min(0)
-    }
-}
-
-// ===========================================================================
 // Tests
-// ===========================================================================
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // --- TrustStage ---------------------------------------------------------
+    // --- TrustStage tests ---
 
     #[test]
-    fn test_trust_stage_stranger() {
-        assert_eq!(TrustStage::from_trust(-50), TrustStage::Stranger);
-        assert_eq!(TrustStage::from_trust(-100), TrustStage::Stranger);
-        assert_eq!(TrustStage::from_trust(-21), TrustStage::Stranger);
+    fn stage_from_score_boundaries() {
+        assert_eq!(TrustStage::from_score(-1.0), TrustStage::Hostile);
+        assert_eq!(TrustStage::from_score(-0.6), TrustStage::Wary);
+        assert_eq!(TrustStage::from_score(-0.2), TrustStage::Neutral);
+        assert_eq!(TrustStage::from_score(0.0), TrustStage::Neutral);
+        assert_eq!(TrustStage::from_score(0.2), TrustStage::Friendly);
+        assert_eq!(TrustStage::from_score(0.6), TrustStage::Allied);
+        assert_eq!(TrustStage::from_score(1.0), TrustStage::Allied);
     }
 
     #[test]
-    fn test_trust_stage_wary() {
-        assert_eq!(TrustStage::from_trust(-20), TrustStage::Wary);
-        assert_eq!(TrustStage::from_trust(-1), TrustStage::Wary);
+    fn stage_labels() {
+        assert_eq!(TrustStage::Hostile.label(), "hostile");
+        assert_eq!(TrustStage::Allied.label(), "allied");
+        assert_eq!(TrustStage::Neutral.label(), "neutral");
     }
 
     #[test]
-    fn test_trust_stage_acquaintance() {
-        assert_eq!(TrustStage::from_trust(0), TrustStage::Acquaintance);
-        assert_eq!(TrustStage::from_trust(19), TrustStage::Acquaintance);
+    fn stage_ordering() {
+        assert!(TrustStage::Hostile < TrustStage::Wary);
+        assert!(TrustStage::Wary < TrustStage::Neutral);
+        assert!(TrustStage::Neutral < TrustStage::Friendly);
+        assert!(TrustStage::Friendly < TrustStage::Allied);
+    }
+
+    // --- TrustEvent tests ---
+
+    #[test]
+    fn positive_event_delta() {
+        let e = TrustEvent::positive("a", "b", 0.3, "helped");
+        assert_eq!(e.delta(), 0.3);
+        assert_eq!(e.parties(), ("a", "b"));
     }
 
     #[test]
-    fn test_trust_stage_friend() {
-        assert_eq!(TrustStage::from_trust(20), TrustStage::Friend);
-        assert_eq!(TrustStage::from_trust(49), TrustStage::Friend);
+    fn negative_event_delta() {
+        let e = TrustEvent::negative("a", "b", 0.2, "lied");
+        assert_eq!(e.delta(), -0.2);
     }
 
     #[test]
-    fn test_trust_stage_companion() {
-        assert_eq!(TrustStage::from_trust(50), TrustStage::Companion);
-        assert_eq!(TrustStage::from_trust(100), TrustStage::Companion);
+    fn betrayal_delta() {
+        let e = TrustEvent::betrayal("a", "b", "backstab");
+        assert_eq!(e.delta(), -0.5);
     }
 
     #[test]
-    fn test_trust_stage_display() {
-        assert_eq!(TrustStage::Companion.to_string(), "Companion");
-        assert_eq!(TrustStage::Stranger.display_name(), "Stranger");
+    fn event_magnitude_capped() {
+        let e = TrustEvent::positive("a", "b", 5.0, "excessive");
+        assert_eq!(e.delta(), 1.0);
     }
 
-    // --- TrustEvent ---------------------------------------------------------
+    // --- TrustDecay tests ---
 
     #[test]
-    fn test_trust_event_impacts() {
-        assert_eq!(TrustEvent::Cooperate(10).impact(), 10);
-        assert_eq!(TrustEvent::Defect(-15).impact(), -15);
-        assert_eq!(TrustEvent::Betray(-30).impact(), -30);
-        assert!(TrustEvent::Forgive(8).is_positive());
-        assert!(TrustEvent::Ignore(-5).is_negative());
+    fn decay_reduces_score() {
+        let d = TrustDecay::new(0.9, 0.0);
+        let result = d.apply(0.5);
+        assert!((result - 0.45).abs() < 1e-9);
     }
 
     #[test]
-    fn test_trust_event_default_impacts() {
-        assert_eq!(TrustEvent::Cooperate(10).default_impact(), 10);
-        assert_eq!(TrustEvent::Defect(-15).default_impact(), -15);
-        assert_eq!(TrustEvent::Ignore(-5).default_impact(), -5);
-        assert_eq!(TrustEvent::Forgive(8).default_impact(), 8);
-        assert_eq!(TrustEvent::Betray(-30).default_impact(), -30);
+    fn decay_negative_score() {
+        let d = TrustDecay::new(0.8, 0.0);
+        let result = d.apply(-0.5);
+        assert!((result - (-0.4)).abs() < 1e-9);
     }
 
-    // --- TrustRelation ------------------------------------------------------
+    #[test]
+    fn decay_floor() {
+        let d = TrustDecay::new(0.5, 0.1);
+        let result = d.apply(0.15);
+        assert!((result - 0.1).abs() < 1e-9);
+    }
 
     #[test]
-    fn test_trust_relation_new() {
-        let r = TrustRelation::new();
-        assert_eq!(r.a_trusts_b, 0);
-        assert_eq!(r.b_trusts_a, 0);
+    fn no_decay() {
+        let d = TrustDecay::none();
+        assert_eq!(d.apply(0.5), 0.5);
+    }
+
+    // --- ForgivenessConfig tests ---
+
+    #[test]
+    fn forgiveness_recover_negative() {
+        let f = ForgivenessConfig::new(0.05, 0.2);
+        let result = f.apply(-0.3);
+        assert!((result - (-0.25)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forgiveness_does_not_affect_positive() {
+        let f = ForgivenessConfig::new(0.1, 0.5);
+        assert_eq!(f.apply(0.5), 0.5);
+    }
+
+    #[test]
+    fn no_forgiveness() {
+        let f = ForgivenessConfig::none();
+        assert_eq!(f.apply(-0.5), -0.5);
+    }
+
+    // --- TrustRelation tests ---
+
+    #[test]
+    fn relation_new_starts_neutral() {
+        let r = TrustRelation::new("alice", "bob");
+        assert_eq!(r.a_to_b, 0.0);
+        assert_eq!(r.b_to_a, 0.0);
         assert_eq!(r.average(), 0.0);
+        assert_eq!(r.stage_a_to_b(), TrustStage::Neutral);
     }
 
     #[test]
-    fn test_trust_relation_apply_events() {
-        let mut r = TrustRelation::new();
-        r.apply_event_a_to_b(TrustEvent::Cooperate(10));
-        assert_eq!(r.a_trusts_b, 10);
-        r.apply_event_a_to_b(TrustEvent::Betray(-30));
-        assert_eq!(r.a_trusts_b, -20);
-        r.apply_event_b_to_a(TrustEvent::Cooperate(15));
-        assert_eq!(r.b_trusts_a, 15);
+    fn relation_with_scores_clamped() {
+        let r = TrustRelation::with_scores("a", "b", 2.0, -2.0);
+        assert_eq!(r.a_to_b, 1.0);
+        assert_eq!(r.b_to_a, -1.0);
     }
 
     #[test]
-    fn test_trust_relation_clamped() {
-        let mut r = TrustRelation::from_scores(95, -90);
-        r.apply_event_a_to_b(TrustEvent::Cooperate(20)); // 95+20=115 -> clamped to 100
-        assert_eq!(r.a_trusts_b, TRUST_MAX);
-        r.apply_event_b_to_a(TrustEvent::Betray(-30)); // -90-30=-120 -> clamped to -100
-        assert_eq!(r.b_trusts_a, TRUST_MIN);
+    fn relation_trust_from_lookup() {
+        let r = TrustRelation::with_scores("alice", "bob", 0.5, -0.3);
+        assert_eq!(r.trust_from("alice", "bob"), Some(0.5));
+        assert_eq!(r.trust_from("bob", "alice"), Some(-0.3));
+        assert_eq!(r.trust_from("alice", "carol"), None);
     }
 
     #[test]
-    fn test_trust_relation_decay() {
-        let mut r = TrustRelation::from_scores(100, -100);
-        r.decay(0.1);
-        assert_eq!(r.a_trusts_b, 90);  // 100 - 10
-        assert_eq!(r.b_trusts_a, -90); // -100 + 10
+    fn relation_apply_event() {
+        let mut r = TrustRelation::new("a", "b");
+        r.apply_event(&TrustEvent::positive("a", "b", 0.4, "helped"));
+        assert!((r.a_to_b - 0.4).abs() < 1e-9);
+        assert!((r.b_to_a).abs() < 1e-9); // unchanged
     }
 
     #[test]
-    fn test_mutual_acquaintance() {
-        let mut r = TrustRelation::from_scores(5, 5);
-        assert!(r.is_mutual_acquaintance());
-        r.a_trusts_b = -5;
-        assert!(!r.is_mutual_acquaintance());
+    fn relation_involves() {
+        let r = TrustRelation::new("x", "y");
+        assert!(r.involves("x"));
+        assert!(r.involves("y"));
+        assert!(!r.involves("z"));
     }
 
-    // --- TrustDecay ---------------------------------------------------------
+    // --- TrustNetwork tests ---
 
     #[test]
-    fn test_trust_decay_steps() {
-        let mut d = TrustDecay::new(80, 0.5);
-        d.step();
-        assert_eq!(d.trust, 40); // 80 - 40
-        d.step();
-        assert_eq!(d.trust, 20); // 40 - 20
-        d.step();
-        assert_eq!(d.trust, 10);
-    }
-
-    #[test]
-    fn test_trust_decay_to_zero() {
-        let mut d = TrustDecay::new(1, 0.5);
-        d.step();
-        assert_eq!(d.trust, 0); // 1 - round(0.5) = 0
+    fn network_get_or_create() {
+        let mut net = TrustNetwork::new();
+        let rel = net.get_or_create("a", "b");
+        assert_eq!(rel.agent_a, "a");
+        assert_eq!(rel.agent_b, "b");
+        assert_eq!(net.relation_count(), 1);
     }
 
     #[test]
-    fn test_trust_decay_negative() {
-        let mut d = TrustDecay::new(-60, 0.5);
-        d.step();
-        assert_eq!(d.trust, -30);
-    }
-
-    // --- ForgivenessConfig --------------------------------------------------
-
-    #[test]
-    fn test_forgiveness_applies() {
-        let cfg = ForgivenessConfig::recommended(); // rate 0.6, threshold -50, cooldown 5
-        let (new_trust, steps) = cfg.apply(-30, 10); // above cooldown
-        assert!(new_trust > -30); // moved toward zero
-        assert_eq!(steps, 0); // cooldown reset
+    fn network_order_independent() {
+        let mut net = TrustNetwork::new();
+        net.get_or_create("b", "a");
+        assert!(net.get("a", "b").is_some());
+        assert!(net.get("b", "a").is_some());
+        assert_eq!(net.relation_count(), 1);
     }
 
     #[test]
-    fn test_forgiveness_cooldown_blocks() {
-        let cfg = ForgivenessConfig::recommended();
-        let (new_trust, _) = cfg.apply(-30, 2); // below cooldown of 5
-        assert_eq!(new_trust, -30); // unchanged
+    fn network_apply_event() {
+        let mut net = TrustNetwork::new();
+        net.apply_event(&TrustEvent::positive("alice", "bob", 0.6, "cooperative"));
+        let rel = net.get("alice", "bob").unwrap();
+        assert!((rel.trust_from("alice", "bob").unwrap() - 0.6).abs() < 1e-9);
     }
 
     #[test]
-    fn test_forgiveness_threshold_blocks() {
-        let cfg = ForgivenessConfig::recommended(); // threshold -50
-        let (new_trust, _) = cfg.apply(-60, 10); // below threshold
-        assert_eq!(new_trust, -60);
+    fn network_tick_decay() {
+        let mut net = TrustNetwork::with_config(
+            TrustDecay::new(0.5, 0.0),
+            ForgivenessConfig::none(),
+        );
+        net.apply_event(&TrustEvent::positive("a", "b", 0.8, "good"));
+        net.tick();
+        let rel = net.get("a", "b").unwrap();
+        assert!((rel.a_to_b - 0.4).abs() < 1e-9);
     }
 
     #[test]
-    fn test_forgiveness_positive_ignored() {
-        let cfg = ForgivenessConfig::recommended();
-        let (new_trust, _) = cfg.apply(10, 10);
-        assert_eq!(new_trust, 10); // positive trust not affected
-    }
-
-    // --- TrustNetwork -------------------------------------------------------
-
-    #[test]
-    fn test_network_basic() {
-        let mut net = TrustNetwork::with_agents(&["alice", "bob", "carol"]);
-        assert_eq!(net.agent_count(), 3);
-
-        net.apply_event("alice", "bob", TrustEvent::Cooperate(20));
-        let rel = net.trust_between("alice", "bob").unwrap();
-        assert_eq!(rel.a_trusts_b, 20);
-
-        // Reverse direction still 0
-        assert_eq!(rel.b_trusts_a, 0);
+    fn network_agents_list() {
+        let mut net = TrustNetwork::new();
+        net.apply_event(&TrustEvent::positive("a", "b", 0.1, "hi"));
+        net.apply_event(&TrustEvent::positive("b", "c", 0.1, "hi"));
+        let mut agents = net.agents();
+        agents.sort();
+        assert_eq!(agents, vec!["a", "b", "c"]);
     }
 
     #[test]
-    fn test_network_most_least_trusted() {
-        let mut net = TrustNetwork::with_agents(&["alice", "bob", "carol"]);
-        net.apply_event("alice", "bob", TrustEvent::Cooperate(30));
-        net.apply_event("carol", "bob", TrustEvent::Cooperate(20));
-        assert_eq!(net.most_trusted().unwrap(), "bob");
+    fn network_relations_for_agent() {
+        let mut net = TrustNetwork::new();
+        net.apply_event(&TrustEvent::positive("a", "b", 0.1, "hi"));
+        net.apply_event(&TrustEvent::positive("a", "c", 0.2, "hi"));
+        assert_eq!(net.relations_for("a").len(), 2);
+        assert_eq!(net.relations_for("b").len(), 1);
+    }
 
-        net.apply_event("alice", "carol", TrustEvent::Betray(-40));
-        net.apply_event("bob", "carol", TrustEvent::Defect(-10));
-        assert_eq!(net.least_trusted().unwrap(), "carol");
+    // --- ReputationScore tests ---
+
+    #[test]
+    fn reputation_empty_average() {
+        let rep = ReputationScore::new("agent");
+        assert_eq!(rep.average(), 0.0);
+        assert_eq!(rep.count(), 0);
+        assert_eq!(rep.stage(), TrustStage::Neutral);
     }
 
     #[test]
-    fn test_network_mutual_trust() {
-        let mut net = TrustNetwork::with_agents(&["alice", "bob"]);
-        net.apply_event("alice", "bob", TrustEvent::Cooperate(20));
-        net.apply_event("bob", "alice", TrustEvent::Cooperate(10));
-        let mt = net.mutual_trust("alice", "bob");
-        assert_eq!(mt, 15.0); // (20 + 10) / 2
+    fn reputation_average() {
+        let mut rep = ReputationScore::new("agent");
+        rep.add(0.5);
+        rep.add(-0.3);
+        assert!((rep.average() - 0.1).abs() < 1e-9);
     }
 
     #[test]
-    fn test_network_trust_circle() {
-        let mut net = TrustNetwork::with_agents(&["alice", "bob", "carol", "dave"]);
-        net.apply_event("alice", "bob", TrustEvent::Cooperate(30));
-        net.apply_event("bob", "alice", TrustEvent::Cooperate(30));
-        net.apply_event("alice", "carol", TrustEvent::Cooperate(10));
-        net.apply_event("carol", "alice", TrustEvent::Cooperate(10));
-        // dave stays neutral
-        let circle = net.trust_circle("alice", 10.0);
-        assert!(circle.contains(&"bob"));
-        assert!(circle.contains(&"carol"));
-        assert!(!circle.contains(&"dave"));
-    }
-
-    // --- ReputationScore ----------------------------------------------------
-
-    #[test]
-    fn test_reputation_average() {
-        let rs = ReputationScore::new(&[10, 20, 30]);
-        assert_eq!(rs.average(), 20.0);
+    fn reputation_min_max() {
+        let mut rep = ReputationScore::new("agent");
+        rep.add(0.8);
+        rep.add(-0.4);
+        assert!((rep.max() - 0.8).abs() < 1e-9);
+        assert!((rep.min() - (-0.4)).abs() < 1e-9);
     }
 
     #[test]
-    fn test_reputation_weighted() {
-        let rs = ReputationScore::new(&[10, 20, 30]);
-        let weighted = rs.weighted_average(&[1.0, 2.0, 3.0]);
-        // (10*1 + 20*2 + 30*3) / (1+2+3) = (10+40+90)/6 = 23.333...
-        assert!((weighted - 23.333).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_reputation_min_max() {
-        let rs = ReputationScore::new(&[-10, 25, 50, -5]);
-        assert_eq!(rs.min(), -10);
-        assert_eq!(rs.max(), 50);
-    }
-
-    #[test]
-    fn test_reputation_consensus() {
-        let rs = ReputationScore::new(&[10, -5, 0, 20, -10]);
-        // 3 non-negative out of 5
-        assert!((rs.consensus() - 0.6).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_reputation_stage() {
-        let rs = ReputationScore::new(&[50, 60, 55]);
-        assert_eq!(rs.stage(), TrustStage::Companion);
-    }
-
-    #[test]
-    fn test_reputation_empty() {
-        let rs = ReputationScore::new(&[]);
-        assert_eq!(rs.average(), 0.0);
-        assert_eq!(rs.min(), 0);
-        assert_eq!(rs.max(), 0);
+    fn reputation_from_network() {
+        let mut net = TrustNetwork::new();
+        net.apply_event(&TrustEvent::positive("bob", "alice", 0.5, "helpful"));
+        net.apply_event(&TrustEvent::negative("carol", "alice", 0.3, "rude"));
+        let rep = ReputationScore::from_network(&net, "alice");
+        assert_eq!(rep.count(), 2);
+        // bob's trust toward alice = 0.5, carol's trust toward alice = -0.3
+        assert!((rep.average() - 0.1).abs() < 1e-9);
     }
 }

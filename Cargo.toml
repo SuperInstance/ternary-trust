@@ -2,7 +2,5 @@
 name = "ternary-trust"
 version = "0.1.0"
 edition = "2021"
-description = "Trust and relationship dynamics for ternary agents"
 license = "MIT"
-
-[dependencies]
+description = "Trust and relationship dynamics between agents for SuperInstance"
