@@ -100,3 +100,11 @@ This crate is a leaf dependency — it doesn't depend on other ternary crates.
 ## License
 
 MIT
+
+## See Also
+- **ternary-consensus** — related
+- **ternary-quorum** — related
+- **ternary-room** — related
+- **ternary-signaling** — related
+- **ternary-steward** — related
+
