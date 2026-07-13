@@ -33,10 +33,10 @@ fn main() {
         ForgivenessConfig::new(0.02, 0.1), // recover 0.02/tick, max 0.1/tick
     );
 
-    // Alice helps Bob — trust increases
+    // Bob shared resources, so Alice's trust in Bob rises (from->to).
     net.apply_event(&TrustEvent::positive("alice", "bob", 0.3, "shared resources"));
 
-    // Bob betrays Alice — big trust drop
+    // Alice stole supplies, so Bob's trust in Alice drops sharply (from->to).
     net.apply_event(&TrustEvent::betrayal("bob", "alice", "stole supplies"));
 
     let rel = net.get("alice", "bob").unwrap();
@@ -65,7 +65,7 @@ fn main() {
 
 Scores live on a -1.0 to +1.0 continuum, clamped on every mutation. `TrustStage::from_score()` maps ranges to one of five stages — agents use stages for decisions, not raw floats.
 
-`TrustNetwork` stores relations in a `HashMap` keyed by a canonical (alphabetically-ordered) agent pair, so `get("alice", "bob")` and `get("bob", "alice")` return the same relation. Events specify a direction (from/to) so the correct directional score is updated.
+`TrustNetwork` stores relations in a `HashMap` keyed by a canonical (alphabetically-ordered) agent pair, so `get("alice", "bob")` and `get("bob", "alice")` return the same relation. Events specify a direction (`from`/`to`) where **`from` is the agent whose trust changes (the observer) and `to` is the agent being judged**; the event's delta is applied to the `from → to` score. For example, `positive("alice", "bob", ...)` raises Alice's trust in Bob because Alice observed Bob doing something positive.
 
 The `tick()` method applies decay then forgiveness to every relation in the network. Decay multiplies scores by the retention rate, pulling toward zero. Forgiveness adds the recovery rate to negative scores, also pulling toward zero but only from below.
 
