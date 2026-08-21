@@ -6,6 +6,20 @@
 //! dogmind-arena), trust decay over time, forgiveness mechanics, and a
 //! trust network graph. Reputation scores aggregate trust from multiple
 //! sources into a single metric.
+//!
+//! # When to use this
+//!
+//! Reach for `ternary-trust` when one or more agents need to *remember* how
+//! other agents have behaved over time and make decisions on that basis — for
+//! example: multi-agent cooperation (prioritize allied partners, avoid hostile
+//! ones), game AI relationships (NPCs remember the player's actions),
+//! distributed-system reliability (circuit-break hostile dependencies), or
+//! reputation-based partner routing. If a boolean "trusted / not trusted" is
+//! too coarse but a full Bayesian reputation engine is too heavy, the
+//! five-stage model here is a deliberate middle ground.
+//!
+//! Scores live on a `-1.0..=1.0` continuum and are clamped on every mutation,
+//! so a single event can never push a score out of range.
 
 use std::collections::HashMap;
 
@@ -25,7 +39,14 @@ pub enum TrustStage {
 
 impl TrustStage {
     /// Convert a numeric score (-1.0 to +1.0) into a trust stage.
+    ///
+    /// Boundaries: `< -0.6` → Hostile, `< -0.2` → Wary, `< 0.2` → Neutral,
+    /// `< 0.6` → Friendly, otherwise Allied. A `NaN` score is reported as
+    /// Neutral rather than silently classified via the catch-all arm.
     pub fn from_score(score: f64) -> Self {
+        if score.is_nan() {
+            return TrustStage::Neutral;
+        }
         if score < -0.6 {
             TrustStage::Hostile
         } else if score < -0.2 {
@@ -56,33 +77,55 @@ impl TrustStage {
 // ---------------------------------------------------------------------------
 
 /// An action that modifies trust between two agents.
+///
+/// Direction convention: `from` is the agent whose trust is updated (the
+/// observer/judge); `to` is the agent being judged. The event's delta is
+/// applied to the `from → to` trust score. For example,
+/// `Positive { from: "alice", to: "bob", .. }` raises Alice's trust in Bob
+/// because Alice observed Bob doing something positive.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrustEvent {
     /// A positive action that increases trust.
     Positive {
+        /// Agent whose trust is updated (the observer).
         from: String,
+        /// Agent being judged (the observed).
         to: String,
+        /// Magnitude of the trust increase (non-negative; capped to 1.0).
         magnitude: f64,
+        /// Human-readable description of what was observed.
         description: String,
     },
     /// A negative action that decreases trust.
     Negative {
+        /// Agent whose trust is updated (the observer).
         from: String,
+        /// Agent being judged (the observed).
         to: String,
+        /// Magnitude of the trust decrease (non-negative; capped to 1.0).
         magnitude: f64,
+        /// Human-readable description of what was observed.
         description: String,
     },
-    /// A betrayal — large negative trust impact.
+    /// A betrayal — large negative trust impact (fixed -0.5 delta).
     Betrayal {
+        /// Agent whose trust is updated (the observer).
         from: String,
+        /// Agent being judged (the observed).
         to: String,
+        /// Human-readable description of the betrayal.
         description: String,
     },
 }
 
 impl TrustEvent {
     /// Create a positive trust event.
-    pub fn positive(from: impl Into<String>, to: impl Into<String>, magnitude: f64, desc: impl Into<String>) -> Self {
+    pub fn positive(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        magnitude: f64,
+        desc: impl Into<String>,
+    ) -> Self {
         TrustEvent::Positive {
             from: from.into(),
             to: to.into(),
@@ -92,7 +135,12 @@ impl TrustEvent {
     }
 
     /// Create a negative trust event.
-    pub fn negative(from: impl Into<String>, to: impl Into<String>, magnitude: f64, desc: impl Into<String>) -> Self {
+    pub fn negative(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        magnitude: f64,
+        desc: impl Into<String>,
+    ) -> Self {
         TrustEvent::Negative {
             from: from.into(),
             to: to.into(),
@@ -102,7 +150,11 @@ impl TrustEvent {
     }
 
     /// Create a betrayal event (large negative impact, magnitude fixed at -0.5).
-    pub fn betrayal(from: impl Into<String>, to: impl Into<String>, desc: impl Into<String>) -> Self {
+    pub fn betrayal(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        desc: impl Into<String>,
+    ) -> Self {
         TrustEvent::Betrayal {
             from: from.into(),
             to: to.into(),
@@ -236,7 +288,9 @@ impl Default for ForgivenessConfig {
 /// Bidirectional trust scores between two agents.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrustRelation {
+    /// One endpoint of the relation.
     pub agent_a: String,
+    /// The other endpoint of the relation.
     pub agent_b: String,
     /// Trust from A toward B (-1.0 to +1.0).
     pub a_to_b: f64,
@@ -282,6 +336,11 @@ impl TrustRelation {
     }
 
     /// Apply a trust event delta to the correct direction.
+    ///
+    /// If the event's parties do not match this relation's two agents, the
+    /// event is ignored (no-op) — a `TrustRelation` only tracks trust between
+    /// its own `agent_a` and `agent_b`. Use [`TrustNetwork::apply_event`] to
+    /// route an event to the correct relation automatically.
     pub fn apply_event(&mut self, event: &TrustEvent) {
         let (from, to) = event.parties();
         let delta = event.delta();
@@ -357,7 +416,9 @@ impl TrustNetwork {
     /// Get a mutable reference to the relation, creating it at neutral if needed.
     pub fn get_or_create(&mut self, a: &str, b: &str) -> &mut TrustRelation {
         let key = Self::key(a, b);
-        self.relations.entry(key).or_insert_with(|| TrustRelation::new(a, b))
+        self.relations
+            .entry(key)
+            .or_insert_with(|| TrustRelation::new(a, b))
     }
 
     /// Apply a trust event to the network.
@@ -408,7 +469,9 @@ impl TrustNetwork {
 /// Aggregate trust score for an agent, computed from multiple sources.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReputationScore {
+    /// The agent this reputation describes.
     pub agent: String,
+    /// Trust scores that other agents hold toward this agent.
     pub scores: Vec<f64>,
 }
 
@@ -434,14 +497,28 @@ impl ReputationScore {
         self.scores.iter().sum::<f64>() / self.scores.len() as f64
     }
 
-    /// Compute the minimum (worst-case) reputation.
+    /// Compute the minimum (worst-case) reputation. Returns 0.0 if no scores.
+    ///
+    /// Uses [`f64::total_cmp`] so a stray `NaN` is ordered consistently
+    /// rather than panicking.
     pub fn min(&self) -> f64 {
-        self.scores.iter().cloned().fold(0.0_f64, f64::min)
+        self.scores
+            .iter()
+            .copied()
+            .min_by(f64::total_cmp)
+            .unwrap_or(0.0)
     }
 
-    /// Compute the maximum (best-case) reputation.
+    /// Compute the maximum (best-case) reputation. Returns 0.0 if no scores.
+    ///
+    /// Uses [`f64::total_cmp`] so a stray `NaN` is ordered consistently
+    /// rather than panicking.
     pub fn max(&self) -> f64 {
-        self.scores.iter().cloned().fold(0.0_f64, f64::max)
+        self.scores
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0)
     }
 
     /// The trust stage for the average reputation.
@@ -455,17 +532,19 @@ impl ReputationScore {
     }
 
     /// Build a reputation score from a network for a given agent.
+    ///
+    /// Collects the *inbound* trust toward `agent` — i.e. how every other
+    /// agent that has a relation with `agent` feels about `agent`. `agent`'s
+    /// own outbound opinions of others are not included. Returns an empty
+    /// score (average 0.0, Neutral) if `agent` has no relations.
     pub fn from_network(network: &TrustNetwork, agent: &str) -> Self {
         let mut rep = Self::new(agent);
         for rel in network.relations_for(agent) {
-            if let Some(score) = rel.trust_from(agent, &rel.agent_a).or_else(|| rel.trust_from(agent, &rel.agent_b)) {
-                // Get the score others have toward this agent
-            }
-            // Add the trust others have toward this agent
+            // Add the trust the OTHER agent holds toward `agent`.
             if rel.agent_a == agent {
-                rep.add(rel.b_to_a); // how B feels about A
-            } else {
-                rep.add(rel.a_to_b); // how A feels about this agent
+                rep.add(rel.b_to_a); // agent_b's trust toward agent_a (== agent)
+            } else if rel.agent_b == agent {
+                rep.add(rel.a_to_b); // agent_a's trust toward agent_b (== agent)
             }
         }
         rep
@@ -657,10 +736,8 @@ mod tests {
 
     #[test]
     fn network_tick_decay() {
-        let mut net = TrustNetwork::with_config(
-            TrustDecay::new(0.5, 0.0),
-            ForgivenessConfig::none(),
-        );
+        let mut net =
+            TrustNetwork::with_config(TrustDecay::new(0.5, 0.0), ForgivenessConfig::none());
         net.apply_event(&TrustEvent::positive("a", "b", 0.8, "good"));
         net.tick();
         let rel = net.get("a", "b").unwrap();
@@ -722,5 +799,146 @@ mod tests {
         assert_eq!(rep.count(), 2);
         // bob's trust toward alice = 0.5, carol's trust toward alice = -0.3
         assert!((rep.average() - 0.1).abs() < 1e-9);
+    }
+
+    // --- Regression tests for the fold-from-zero min/max bug ---
+
+    #[test]
+    fn reputation_max_all_negative() {
+        // max of two negative scores must be the larger (closer to zero) one,
+        // NOT 0.0 (which the old `fold(0.0, f64::max)` returned).
+        let mut rep = ReputationScore::new("agent");
+        rep.add(-0.3);
+        rep.add(-0.5);
+        assert!((rep.max() - (-0.3)).abs() < 1e-9, "max={}", rep.max());
+        assert!((rep.min() - (-0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reputation_min_all_positive() {
+        // min of two positive scores must be the smaller one, NOT 0.0.
+        let mut rep = ReputationScore::new("agent");
+        rep.add(0.5);
+        rep.add(0.8);
+        assert!((rep.min() - 0.5).abs() < 1e-9, "min={}", rep.min());
+        assert!((rep.max() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reputation_min_max_empty() {
+        let rep = ReputationScore::new("agent");
+        assert_eq!(rep.min(), 0.0);
+        assert_eq!(rep.max(), 0.0);
+    }
+
+    // --- Network/edge-case coverage ---
+
+    #[test]
+    fn reputation_from_network_empty() {
+        // An agent with no relations has an empty (Neutral) reputation.
+        let net = TrustNetwork::new();
+        let rep = ReputationScore::from_network(&net, "ghost");
+        assert_eq!(rep.count(), 0);
+        assert_eq!(rep.average(), 0.0);
+        assert_eq!(rep.stage(), TrustStage::Neutral);
+    }
+
+    #[test]
+    fn reputation_from_network_inbound_only() {
+        // Reputation collects how OTHERS feel about the target, not the
+        // target's own outbound opinions. Here Alice rates Bob highly, but
+        // that outbound opinion must not inflate Alice's own reputation —
+        // only Bob's inbound opinion of Alice counts.
+        let mut net = TrustNetwork::new();
+        net.apply_event(&TrustEvent::positive("alice", "bob", 0.9, "great")); // outbound
+        net.apply_event(&TrustEvent::positive("bob", "alice", 0.4, "ok")); // inbound
+        let rep = ReputationScore::from_network(&net, "alice");
+        assert_eq!(rep.count(), 1);
+        assert!((rep.average() - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stage_nan_is_neutral() {
+        // A NaN must not silently fall through to Allied.
+        assert_eq!(TrustStage::from_score(f64::NAN), TrustStage::Neutral);
+        assert_eq!(TrustStage::from_score(f64::INFINITY), TrustStage::Allied);
+        assert_eq!(
+            TrustStage::from_score(f64::NEG_INFINITY),
+            TrustStage::Hostile
+        );
+    }
+
+    #[test]
+    fn forgiveness_capped_at_zero() {
+        // Forgiveness must never push a negative score past zero into
+        // positive territory: the recovery is clamped by score.abs().
+        let f = ForgivenessConfig::new(0.5, 1.0);
+        assert_eq!(f.apply(-0.01), 0.0); // capped by score.abs()
+        assert_eq!(f.apply(-0.4), 0.0); // recovery_rate > |score| -> lands on 0
+        assert_eq!(f.apply(0.7), 0.7); // positive untouched
+
+        // Capped by recovery_rate.
+        let f = ForgivenessConfig::new(0.1, 1.0);
+        assert!((f.apply(-0.4) - (-0.3)).abs() < 1e-9);
+        // Capped by max_recovery.
+        let f = ForgivenessConfig::new(1.0, 0.05);
+        assert!((f.apply(-0.4) - (-0.35)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decay_zero_stays_zero() {
+        // A floor must not conjure trust out of a zero score.
+        let d = TrustDecay::new(0.9, 0.2);
+        assert_eq!(d.apply(0.0), 0.0);
+    }
+
+    #[test]
+    fn relation_apply_event_ignores_unrelated_parties() {
+        // A relation only tracks its own two agents; an event about a third
+        // agent is a documented no-op and must not corrupt either score.
+        let mut r = TrustRelation::with_scores("alice", "bob", 0.5, -0.2);
+        r.apply_event(&TrustEvent::positive("alice", "carol", 0.9, "oops"));
+        assert_eq!(r.a_to_b, 0.5);
+        assert_eq!(r.b_to_a, -0.2);
+    }
+
+    // --- Manipulation resistance: scores are bounded and clamped ---
+
+    #[test]
+    fn trust_bounded_by_clamping() {
+        // No amount of self-praise via repeated positive events can push a
+        // score beyond +1.0 (or below -1.0). A single actor spamming events
+        // saturates at the boundary rather than running away.
+        let mut net = TrustNetwork::new();
+        for _ in 0..100 {
+            net.apply_event(&TrustEvent::positive(
+                "mallory",
+                "target",
+                1.0,
+                "self-praise",
+            ));
+        }
+        let rel = net.get("mallory", "target").unwrap();
+        assert_eq!(rel.trust_from("mallory", "target").unwrap(), 1.0);
+
+        // And a flood of betrayals cannot go below -1.0.
+        for _ in 0..100 {
+            net.apply_event(&TrustEvent::betrayal("target", "mallory", "sabotage"));
+        }
+        let rel = net.get("mallory", "target").unwrap();
+        assert_eq!(rel.trust_from("target", "mallory").unwrap(), -1.0);
+    }
+
+    #[test]
+    fn single_event_delta_is_bounded() {
+        // A single event changes trust by at most its magnitude (<=1.0), so
+        // one interaction cannot arbitrarily inflate or crater a score.
+        let mut net = TrustNetwork::new();
+        net.apply_event(&TrustEvent::positive("a", "b", 0.3, "x"));
+        let before = net.get("a", "b").unwrap().a_to_b;
+        net.apply_event(&TrustEvent::negative("a", "b", 0.2, "y"));
+        let after = net.get("a", "b").unwrap().a_to_b;
+        let change = (after - before).abs();
+        assert!(change <= 0.2 + 1e-9);
     }
 }
